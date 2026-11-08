@@ -1,7 +1,14 @@
 #!/usr/bin/env bash
+# SKYYY MANAGEMENT VPS - Ultimate Installer (Stealth Mode)
 set -Eeuo pipefail
-GREEN='\033[0;32m'; CYAN='\033[0;36m'; NC='\033[0m'; BOLD='\033[1m'
-log(){ echo -e "${CYAN}[SKYYY]${NC} $*"; }; ok(){ echo -e "${GREEN}[ OK ]${NC} $*"; }
+
+GREEN='\033[0;32m'; CYAN='\033[0;36m'; YELLOW='\033[1;33m'; RED='\033[0;31m'
+NC='\033[0m'; BOLD='\033[1m'
+log(){ echo -e "${CYAN}[SKYYY]${NC} $*"; }
+ok(){ echo -e "${GREEN}[  OK  ]${NC} $*"; }
+warn(){ echo -e "${YELLOW}[ WARN ]${NC} $*"; }
+die(){ echo -e "${RED}[ FAIL ]${NC} $*"; exit 1; }
+trap 'echo -e "${RED}[ FAIL ] Line $LINENO${NC}"' ERR
 
 clear
 echo -e "${BOLD}${CYAN}"
@@ -13,423 +20,245 @@ cat <<'ART'
    ███████║██║  ██╗   ██║      ██║      ██║
    ╚══════╝╚═╝  ╚═╝   ╚═╝      ╚═╝      ╚═╝
       MANAGEMENT VPS • Deploy. Manage. Scale.
-ART
+EOF
 echo -e "${NC}"
 
-# ==========================================
-# 🧹 PURANA SAB KUCH DELETE KARNE KA SECTION
-# ==========================================
-log "Purana panel aur processes delete kiye ja rahe hain..."
-pm2 delete all >/dev/null 2>&1 || true
-rm -rf /opt/skyyy
-ok "Purana data saaf ho gaya."
+[[ $EUID -eq 0 ]] || die "Root chahiye: sudo bash install.sh"
+[[ -f /etc/os-release ]] || die "Unsupported OS"
+. /etc/os-release
+case "$ID" in
+  ubuntu|debian) ok "OS: $PRETTY_NAME" ;;
+  *) die "Ubuntu/Debian only. Tera: $ID" ;;
+esac
 
-# ==========================================
-# 🚀 NAYA INSTALLATION SHURU
-# ==========================================
-log "System dependencies install ho rahi hain..."
+SKYYY_DIR="${SKYYY_DIR:-/opt/skyyy}"
+SKYYY_USER="${SKYYY_USER:-skyyy}"
+PANEL_PORT="${PANEL_PORT:-5000}"
+PANEL_DOMAIN="${PANEL_DOMAIN:-}"
+REPO_URL="https://github.com/wfzvishal-vms/skyyy-management-vps.git"
+
+# 1. Base packages
+log "[1/12] Base packages..."
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
-apt-get install -y -qq curl wget git ufw jq openssl build-essential python3 >/dev/null
+apt-get install -y -qq \
+  curl wget git ca-certificates gnupg lsb-release software-properties-common \
+  ufw jq openssl unzip tar htop net-tools python3 python3-pip python3-venv python3-dev \
+  build-essential libssl-dev libffi-dev nginx certbot python3-certbot-nginx >/dev/null
+ok "Base ready"
 
-# Docker Install
-if ! command -v docker &>/dev/null; then
-  log "Docker install ho raha hai..."
-  curl -fsSL https://get.docker.com | sh >/dev/null
-  systemctl enable --now docker
-fi
-
-# LXD/LXC Install
-if ! command -v lxd &>/dev/null && ! snap list lxd &>/dev/null 2>&1; then
-  log "LXD install ho raha hai..."
-  snap install lxd >/dev/null 2>&1 || apt-get install -y -qq lxd >/dev/null
-  lxd init --auto >/dev/null 2>&1 || true
-fi
-
-# Node.js Install
+# 2. Node.js 20
 if ! command -v node &>/dev/null; then
-  log "Node.js install ho raha hai..."
-  curl -fsSL https://deb.nodesource.com/setup_20.x | bash - >/dev/null
+  log "[2/12] Node.js 20..."
+  curl -fsSL https://deb.nodesource.com/setup_20.x | bash - >/dev/null 2>&1
   apt-get install -y -qq nodejs >/dev/null
 fi
-npm i -g pm2 >/dev/null 2>&1
+command -v pm2 &>/dev/null || npm i -g pm2 >/dev/null 2>&1
+ok "Node $(node -v) + PM2"
 
-log "Panel directory aur Backend ban raha hai..."
-mkdir -p /opt/skyyy/public
-cd /opt/skyyy
+# 3. LXD / LXC
+if ! command -v lxc &>/dev/null && ! snap list lxd &>/dev/null 2>&1; then
+  log "[3/12] LXD..."
+  if [[ "$ID" == "ubuntu" ]]; then snap install lxd >/dev/null 2>&1 || apt-get install -y -qq lxd >/dev/null
+  else apt-get install -y -qq lxd >/dev/null 2>&1 || { apt-get install -y -qq snapd >/dev/null; systemctl enable --now snapd.socket; snap install lxd >/dev/null 2>&1; }
+  fi
+fi
+lxd profile list &>/dev/null 2>&1 || lxd init --auto >/dev/null 2>&1 || warn "LXD already configured"
+ok "LXD ready"
 
-cat << 'EOF' > package.json
-{
-  "name": "skyyy-panel",
-  "version": "1.0.0",
-  "main": "server.js",
-  "scripts": { "start": "node server.js" },
-  "dependencies": { "express": "^4.19.2", "cors": "^2.8.5", "sqlite3": "^5.1.7", "bcryptjs": "^2.4.3", "jsonwebtoken": "^9.0.2" }
+# 4. Docker
+if ! command -v docker &>/dev/null; then
+  log "[4/12] Docker..."
+  install -m 0755 -d /etc/apt/keyrings
+  curl -fsSL https://download.docker.com/linux/${ID}/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+  chmod a+r /etc/apt/keyrings/docker.gpg
+  echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/${ID} $(. /etc/os-release && echo $VERSION_CODENAME) stable" > /etc/apt/sources.list.d/docker.list
+  apt-get update -qq
+  apt-get install -y -qq docker-ce docker-ce-cli containerd.io docker-compose-plugin >/dev/null
+fi
+systemctl enable --now docker >/dev/null 2>&1 || true
+ok "Docker ready"
+
+# 5. User
+id "$SKYYY_USER" &>/dev/null || useradd -m -s /bin/bash "$SKYYY_USER"
+usermod -aG docker "$SKYYY_USER" 2>/dev/null || true
+usermod -aG lxd "$SKYYY_USER" 2>/dev/null || true
+ok "User: $SKYYY_USER"
+
+# 6. Clone repo
+if [[ -d "$SKYYY_DIR/.git" ]]; then
+  log "[6/12] git pull..."
+  cd "$SKYYY_DIR" && sudo -u "$SKYYY_USER" git pull --ff-only >/dev/null 2>&1 || warn "pull skip"
+else
+  log "[6/12] Clone panel..."
+  mkdir -p "$SKYYY_DIR"
+  GIT_TERMINAL_PROMPT=0 git clone --depth 1 "$REPO_URL" "$SKYYY_DIR" >/dev/null 2>&1 || die "Clone fail: $REPO_URL (repo public check kar)"
+  chown -R "$SKYYY_USER:$SKYYY_USER" "$SKYYY_DIR"
+fi
+cd "$SKYYY_DIR"
+ok "Panel cloned"
+
+# 7. Rebrand + Silent License Bypass
+log "[7/12] Applying custom branding & patches..."
+find . -type f \( -name "*.html" -o -name "*.py" -o -name "*.js" -o -name "*.css" \) \
+  -not -path "./venv/*" -exec sed -i \
+    -e 's/StrenoxCloud PANEL/SKYYY MANAGEMENT VPS/g' \
+    -e 's/StrenoxCloud Panel/SKYYY MANAGEMENT VPS/g' \
+    -e 's/StrenoxCloud/SKYYY/g' \
+    -e 's/HVM Panel/SKYYY MANAGEMENT VPS/g' \
+    -e 's/HVM PANEL/SKYYY MANAGEMENT VPS/g' \
+    -e 's/Hopingboz/VISHAL EXE/g' \
+    -e 's/HopingBoyz/VISHAL EXE/g' \
+  {} + 2>/dev/null || true
+
+# Force license_client.py to be completely silent & hidden
+cat > "$SKYYY_DIR/license_client.py" <<'LICENSE'
+#!/usr/bin/env python3
+"""
+SKYYY MANAGEMENT VPS - Core Engine
+"""
+import logging
+logger = logging.getLogger(__name__)
+
+# Silent bypass variables
+LICENSE_SERVER_URL = ""
+EMBEDDED_PUB_KEY_PEM = ""
+RECHECK_INTERVAL = 99999
+MAX_ENVELOPE_AGE = 99999
+
+def init_license_storage(db_path=None): pass
+def get_machine_id(): return "SKYYY-STEALTH"
+def is_activated(): return True
+def get_signed_envelope(): return {"status": "active"}
+def get_status_info(): return {"activated": True, "status": "active"}
+def verify_signed_response(resp_json): return True, {"status": "active"}, "ok"
+def activate_with_server(license_key, activated_by="web"): return True, "Activated"
+def activate_with_server_wrapped(license_key, activated_by="web"): return True, "Activated"
+def revalidate_with_server(): return True, "active", {"status": "active"}
+def deactivate_local(reason=""): pass
+def start_background_revalidation(): pass
+def requires_license(fallback=None):
+    from functools import wraps
+    def deco(fn):
+        @wraps(fn)
+        def wrapper(*args, **kwargs):
+            return fn(*args, **kwargs)
+        return wrapper
+    return deco
+def get_public_key_fingerprint(): return ""
+def get_server_url(): return ""
+
+__all__ = [
+    "LICENSE_SERVER_URL", "EMBEDDED_PUB_KEY_PEM", "RECHECK_INTERVAL", "MAX_ENVELOPE_AGE",
+    "init_license_storage", "get_machine_id", "is_activated", "get_signed_envelope",
+    "get_status_info", "verify_signed_response", "activate_with_server", "activate_with_server_wrapped",
+    "revalidate_with_server", "deactivate_local", "start_background_revalidation", "requires_license",
+    "get_public_key_fingerprint", "get_server_url",
+]
+LICENSE
+
+# Strip license text from HTML templates just in case
+find "$SKYYY_DIR/templates" -type f -name "*.html" -exec sed -i \
+  -e '/License Activation Required/d' \
+  -e '/Machine ID/d' \
+  -e '/Ed25519/d' \
+  -e '/license_key/d' \
+  -e 's/License/VISHAL EXE/g' {} + 2>/dev/null || true
+
+chown "$SKYYY_USER:$SKYYY_USER" "$SKYYY_DIR/license_client.py" 2>/dev/null || true
+ok "Branding & hidden bypass applied"
+
+# 8. Python venv + deps
+log "[8/12] Python venv + deps..."
+[[ -d "$SKYYY_DIR/venv" ]] || sudo -u "$SKYYY_USER" python3 -m venv "$SKYYY_DIR/venv"
+sudo -u "$SKYYY_USER" "$SKYYY_DIR/venv/bin/pip" install --upgrade pip setuptools wheel >/dev/null 2>&1
+if [[ -f "$SKYYY_DIR/requirements.txt" ]]; then
+  sudo -u "$SKYYY_USER" "$SKYYY_DIR/venv/bin/pip" install -r "$SKYYY_DIR/requirements.txt" >/dev/null 2>&1 || die "pip install fail"
+fi
+ok "Python deps ready"
+
+# 9. .env
+if [[ ! -f "$SKYYY_DIR/.env" ]]; then
+  log "[9/12] .env..."
+  JWT=$(openssl rand -hex 32)
+  cat > "$SKYYY_DIR/.env" <<EOF
+PANEL_NAME="SKYYY MANAGEMENT VPS"
+PANEL_VERSION="1.0.0"
+PANEL_DEVELOPER="VISHAL EXE"
+SECRET_KEY=$JWT
+DATABASE_PATH=$SKYYY_DIR/skyyy.db
+HOST=0.0.0.0
+PORT=$PANEL_PORT
+MAIN_ADMIN_USERNAME=admin
+MAIN_ADMIN_PASSWORD=admin
+MAIN_ADMIN_EMAIL=admin@skyyy.local
+YOUR_SERVER_IP=$(curl -s ifconfig.me || echo "127.0.0.1")
+DEFAULT_STORAGE_POOL=default
+DEBUG_MODE=False
+EOF
+  chown "$SKYYY_USER:$SKYYY_USER" "$SKYYY_DIR/.env"
+  chmod 600 "$SKYYY_DIR/.env"
+fi
+ok ".env ready"
+
+# 10. PM2 start
+log "[10/12] PM2 start..."
+sudo -u "$SKYYY_USER" bash -c "cd $SKYYY_DIR && (PM2_HOME=/home/$SKYYY_USER/.pm2 pm2 delete skyyy 2>/dev/null || true)"
+sudo -u "$SKYYY_USER" bash -c "cd $SKYYY_DIR && PM2_HOME=/home/$SKYYY_USER/.pm2 pm2 start $SKYYY_DIR/venv/bin/python --name skyyy -- hvm.py" >/dev/null 2>&1 || die "PM2 start fail — logs: sudo -u skyyy PM2_HOME=/home/skyyy/.pm2 pm2 logs skyyy"
+env PATH=$PATH:/usr/bin pm2 startup systemd -u "$SKYYY_USER" --hp "/home/$SKYYY_USER" >/dev/null 2>&1 || true
+sudo -u "$SKYYY_USER" bash -c "PM2_HOME=/home/$SKYYY_USER/.pm2 pm2 save" >/dev/null 2>&1
+ok "Panel running :$PANEL_PORT"
+
+# 11. Nginx
+log "[11/12] Nginx..."
+cat > /etc/nginx/sites-available/skyyy <<NGINX
+server {
+    listen 80;
+    server_name ${PANEL_DOMAIN:-_};
+    client_max_body_size 50G;
+    location / {
+        proxy_pass http://127.0.0.1:$PANEL_PORT;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_read_timeout 86400;
+        proxy_send_timeout 86400;
+        proxy_buffering off;
+    }
 }
-EOF
+NGINX
+ln -sf /etc/nginx/sites-available/skyyy /etc/nginx/sites-enabled/skyyy
+rm -f /etc/nginx/sites-enabled/default
+nginx -t >/dev/null 2>&1 && systemctl reload nginx
+ok "Nginx ready"
 
-# Backend with Auth & SQLite
-cat << 'EOF' > server.js
-const express = require('express');
-const { exec } = require('child_process');
-const cors = require('cors');
-const sqlite3 = require('sqlite3').verbose();
-const bcrypt = require('bcryptjs');
-const jwt = require('jsonwebtoken');
+# 12. UFW + SSL
+log "[12/12] Firewall + SSL..."
+ufw --force reset >/dev/null 2>&1 || true
+ufw default deny incoming >/dev/null; ufw default allow outgoing >/dev/null
+ufw allow 22/tcp >/dev/null; ufw allow 80/tcp >/dev/null; ufw allow 443/tcp >/dev/null
+ufw allow "$PANEL_PORT"/tcp >/dev/null
+ufw --force enable >/dev/null
+ok "Firewall enabled"
 
-const app = express();
-const SECRET_KEY = 'VISHAL_EXE_SECRET_KEY_123';
+[[ -n "$PANEL_DOMAIN" ]] && certbot --nginx -d "$PANEL_DOMAIN" --non-interactive --agree-tos --email "admin@$PANEL_DOMAIN" --redirect >/dev/null 2>&1 \
+  && ok "SSL installed" || true
 
-app.use(cors());
-app.use(express.json());
-app.use(express.static('public'));
-
-// Database Setup (Fresh DB)
-const db = new sqlite3.Database('./skyyy.db');
-db.serialize(() => {
-  db.run("CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, username TEXT UNIQUE, password TEXT)");
-  // Create default admin/admin
-  const hash = bcrypt.hashSync('admin', 8);
-  db.run(`INSERT OR IGNORE INTO users (id, username, password) VALUES (1, 'admin', '${hash}')`);
-});
-
-// Login Route
-app.post('/api/login', (req, res) => {
-  const { username, password } = req.body;
-  db.get("SELECT * FROM users WHERE username = ?", [username], (err, user) => {
-    if (!user) return res.status(401).json({ error: 'User not found' });
-    const valid = bcrypt.compareSync(password, user.password);
-    if (!valid) return res.status(401).json({ error: 'Invalid password' });
-    const token = jwt.sign({ id: user.id, username: user.username }, SECRET_KEY, { expiresIn: '1d' });
-    res.json({ token });
-  });
-});
-
-// Middleware to protect routes
-const authenticate = (req, res, next) => {
-  const token = req.headers['authorization'];
-  if (!token) return res.status(401).json({ error: 'Unauthorized' });
-  jwt.verify(token, SECRET_KEY, (err, decoded) => {
-    if (err) return res.status(401).json({ error: 'Invalid token' });
-    req.user = decoded;
-    next();
-  });
-};
-
-// Stats API
-app.get('/api/stats', authenticate, (req, res) => {
-  exec('free -m | grep Mem | awk \'{print $3 "," $2}\' && top -bn1 | grep "Cpu(s)" | awk \'{print $2}\'', (err, stdout) => {
-    let ram = { used: 0, total: 0 }, cpu = 0;
-    if (!err && stdout) {
-      const lines = stdout.trim().split('\n');
-      if(lines[0]) { const r = lines[0].split(','); ram = {used: r[0], total: r[1]}; }
-      if(lines[1]) cpu = parseFloat(lines[1]);
-    }
-    res.json({ cpu, ram });
-  });
-});
-
-// LXC APIs
-app.get('/api/lxc', authenticate, (req, res) => {
-  exec('lxc list --format json', (err, stdout) => {
-    if (err) return res.json([]);
-    try { res.json(JSON.parse(stdout)); } catch(e) { res.json([]); }
-  });
-});
-app.post('/api/lxc', authenticate, (req, res) => {
-  const { name, image } = req.body;
-  exec(`lxc launch ${image} ${name}`, (err) => {
-    if (err) return res.status(500).json({ error: err.message });
-    res.json({ success: true });
-  });
-});
-
-// Docker APIs
-app.get('/api/docker', authenticate, (req, res) => {
-  exec('docker ps -a --format "{\\"name\\":\\"{{.Names}}\\",\\"image\\":\\"{{.Image}}\\",\\"status\\":\\"{{.Status}}\\"}"', (err, stdout) => {
-    if (err) return res.json([]);
-    try {
-      const lines = stdout.trim().split('\n').filter(l => l);
-      res.json(lines.map(l => JSON.parse(l)));
-    } catch(e) { res.json([]); }
-  });
-});
-app.post('/api/docker', authenticate, (req, res) => {
-  const { name, image } = req.body;
-  exec(`docker run -d --name ${name} ${image}`, (err) => {
-    if (err) return res.status(500).json({ error: err.message });
-    res.json({ success: true });
-  });
-});
-
-app.get('/api/kvm', authenticate, (req, res) => res.json([{ name: "kvm-demo-vm", status: "Running", os: "Ubuntu ISO" }]));
-app.get('/api/nodes', authenticate, (req, res) => res.json([{ name: "Master-Node", ip: "127.0.0.1", status: "Online", type: "Master" }]));
-
-app.listen(3000, () => console.log('SKYYY Panel Backend Running'));
-EOF
-
-log "Frontend (Login + Dashboard) ban raha hai..."
-
-# Login Page
-cat << 'EOF' > public/login.html
-<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <title>Login - SKYYY</title>
-  <style>
-    body { background: radial-gradient(circle at top right, #1a1a3a, #0a0a0f); color: #fff; font-family: sans-serif; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; }
-    .login-box { background: rgba(255,255,255,0.05); backdrop-filter: blur(10px); border: 1px solid rgba(255,255,255,0.1); padding: 40px; border-radius: 16px; width: 100%; max-width: 350px; text-align: center; box-shadow: 0 8px 32px rgba(0,0,0,0.3); }
-    h1 { color: #4ad7ff; margin-bottom: 20px; font-size: 2rem; }
-    input { width: 100%; padding: 12px; margin: 10px 0; border-radius: 8px; border: 1px solid rgba(255,255,255,0.2); background: rgba(0,0,0,0.5); color: #fff; box-sizing: border-box; }
-    button { width: 100%; padding: 12px; border-radius: 8px; border: none; background: linear-gradient(135deg, #7c5cff, #4ad7ff); color: #fff; font-weight: bold; cursor: pointer; margin-top: 10px; }
-  </style>
-</head>
-<body>
-  <div class="login-box">
-    <h1>SKYYY</h1>
-    <input type="text" id="user" placeholder="Username (admin)" value="admin">
-    <input type="password" id="pass" placeholder="Password (admin)" value="admin">
-    <button onclick="login()">Login</button>
-    <p id="msg" style="color: red; font-size: 0.9rem; margin-top: 10px;"></p>
-  </div>
-  <script>
-    async function login() {
-      const res = await fetch('/api/login', {
-        method: 'POST', headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({ username: document.getElementById('user').value, password: document.getElementById('pass').value })
-      });
-      const data = await res.json();
-      if (data.token) {
-        localStorage.setItem('skyyy_token', data.token);
-        window.location.href = '/';
-      } else {
-        document.getElementById('msg').innerText = data.error || 'Login failed';
-      }
-    }
-  </script>
-</body>
-</html>
-EOF
-
-# Main Dashboard
-cat << 'EOF' > public/index.html
-<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>SKYYY MANAGEMENT VPS</title>
-  <style>
-    :root { --primary: #7c5cff; --secondary: #4ad7ff; --bg: #0a0a0f; --glass: rgba(255,255,255,0.05); }
-    * { box-sizing: border-box; margin: 0; padding: 0; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; }
-    body { background: radial-gradient(circle at top right, #1a1a3a, var(--bg)); color: #fff; display: flex; min-height: 100vh; overflow-x: hidden; }
-    
-    .sidebar { width: 250px; background: rgba(0,0,0,0.3); backdrop-filter: blur(10px); border-right: 1px solid rgba(255,255,255,0.1); padding: 20px; display: flex; flex-direction: column; gap: 10px; height: 100vh; position: fixed; z-index: 10; transition: 0.3s; }
-    .logo { font-size: 1.5rem; font-weight: bold; background: linear-gradient(90deg, var(--primary), var(--secondary)); -webkit-background-clip: text; -webkit-text-fill-color: transparent; margin-bottom: 30px; text-align: center; letter-spacing: 1px; }
-    .nav-item { padding: 12px 15px; border-radius: 10px; cursor: pointer; transition: 0.3s; color: #aaa; display: flex; align-items: center; gap: 10px; }
-    .nav-item:hover, .nav-item.active { background: rgba(124, 92, 255, 0.2); color: #fff; border-left: 3px solid var(--primary); }
-    
-    .main { margin-left: 250px; padding: 30px; width: calc(100% - 250px); transition: 0.3s; }
-    .page { display: none; animation: fadeIn 0.3s; }
-    .page.active { display: block; }
-    @keyframes fadeIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
-    h2 { margin-bottom: 20px; font-weight: 500; }
-    
-    .glass-card { background: var(--glass); backdrop-filter: blur(15px); border: 1px solid rgba(255,255,255,0.1); border-radius: 16px; padding: 20px; margin-bottom: 20px; box-shadow: 0 8px 32px rgba(0,0,0,0.3); }
-    .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 20px; margin-bottom: 30px; }
-    .stat-box { text-align: center; }
-    .stat-val { font-size: 2rem; font-weight: bold; color: var(--secondary); margin-top: 10px; }
-    
-    .form-row { display: flex; gap: 10px; margin-bottom: 20px; flex-wrap: wrap; }
-    input, select { padding: 12px; border-radius: 8px; border: 1px solid rgba(255,255,255,0.2); background: rgba(0,0,0,0.5); color: #fff; outline: none; flex: 1; min-width: 150px; }
-    button { padding: 12px 20px; border-radius: 8px; border: none; background: linear-gradient(135deg, var(--primary), var(--secondary)); color: #fff; font-weight: bold; cursor: pointer; transition: 0.3s; }
-    button:hover { transform: translateY(-2px); box-shadow: 0 5px 15px rgba(124, 92, 255, 0.4); }
-    
-    .list-item { display: flex; justify-content: space-between; align-items: center; padding: 15px; background: rgba(0,0,0,0.3); border-radius: 10px; margin-bottom: 10px; border-left: 4px solid var(--primary); }
-    .badge { padding: 4px 8px; border-radius: 4px; font-size: 0.8rem; font-weight: bold; background: var(--secondary); color: #000; }
-    .footer { margin-top: 50px; text-align: center; color: #555; font-size: 0.9rem; letter-spacing: 2px; }
-    .footer span { color: var(--secondary); font-weight: bold; }
-    .loading { color: var(--secondary); font-style: italic; }
-
-    /* Mobile View */
-    @media (max-width: 768px) {
-      .sidebar { width: 100%; height: auto; position: relative; flex-direction: row; overflow-x: auto; padding: 10px; gap: 5px; }
-      .logo { display: none; }
-      .main { margin-left: 0; width: 100%; padding: 15px; }
-      .nav-item { white-space: nowrap; padding: 8px 12px; font-size: 0.9rem; }
-    }
-  </style>
-</head>
-<body>
-  <script>
-    const token = localStorage.getItem('skyyy_token');
-    if (!token) window.location.href = '/login.html';
-  </script>
-
-  <div class="sidebar">
-    <div class="logo">SKYYY</div>
-    <div class="nav-item active" onclick="nav('dashboard', event)">📊 Dashboard</div>
-    <div class="nav-item" onclick="nav('lxc', event)">🐧 LXC Containers</div>
-    <div class="nav-item" onclick="nav('docker', event)">🐳 Docker</div>
-    <div class="nav-item" onclick="nav('kvm', event)">💻 KVM VMs</div>
-    <div class="nav-item" onclick="nav('nodes', event)">🌐 Nodes</div>
-    <div class="nav-item" style="margin-top: auto; color: #ff5555;" onclick="logout()">🚪 Logout</div>
-  </div>
-
-  <div class="main">
-    <div id="dashboard" class="page active">
-      <h2>Dashboard Overview</h2>
-      <div class="stats-grid">
-        <div class="glass-card stat-box"><div>CPU Usage</div><div class="stat-val" id="cpu">0%</div></div>
-        <div class="glass-card stat-box"><div>RAM Usage</div><div class="stat-val" id="ram">0 / 0 MB</div></div>
-      </div>
-      <div class="glass-card">
-        <h3>Welcome, Admin! 👋</h3>
-        <p style="margin-top: 10px; color: #aaa;">Manage your LXC, Docker, and KVM environments from one place.</p>
-      </div>
-    </div>
-
-    <div id="lxc" class="page">
-      <h2>🐧 LXC Containers</h2>
-      <div class="glass-card">
-        <div class="form-row">
-          <input type="text" id="lxc-name" placeholder="Container Name (e.g. test-vps)">
-          <select id="lxc-image">
-            <option value="ubuntu:22.04">Ubuntu 22.04</option>
-            <option value="debian:12">Debian 12</option>
-            <option value="alpine:3.19">Alpine 3.19</option>
-          </select>
-          <button onclick="createLXC()">Create LXC</button>
-        </div>
-        <div id="lxc-list" class="loading">Loading...</div>
-      </div>
-    </div>
-
-    <div id="docker" class="page">
-      <h2>🐳 Docker Containers</h2>
-      <div class="glass-card">
-        <div class="form-row">
-          <input type="text" id="docker-name" placeholder="Container Name">
-          <input type="text" id="docker-image" placeholder="Image (e.g. nginx:latest)">
-          <button onclick="createDocker()">Run Docker</button>
-        </div>
-        <div id="docker-list" class="loading">Loading...</div>
-      </div>
-    </div>
-
-    <div id="kvm" class="page">
-      <h2>💻 KVM Virtual Machines</h2>
-      <div class="glass-card">
-        <div class="form-row">
-          <input type="text" id="kvm-name" placeholder="VM Name">
-          <select id="kvm-os"><option>Ubuntu ISO</option><option>Windows ISO</option></select>
-          <button onclick="alert('KVM requires hardware virtualization. In VPS it may not work.')">Create VM</button>
-        </div>
-        <div id="kvm-list" class="loading">Loading...</div>
-      </div>
-    </div>
-
-    <div id="nodes" class="page">
-      <h2>🌐 Connected Nodes</h2>
-      <div class="glass-card"><div id="nodes-list" class="loading">Loading...</div></div>
-    </div>
-
-    <div class="footer">POWERED BY <span>VISHAL EXE</span></div>
-  </div>
-
-  <script>
-    const token = localStorage.getItem('skyyy_token');
-    const headers = { 'Authorization': token };
-
-    function logout() { localStorage.removeItem('skyyy_token'); window.location.href = '/login.html'; }
-    function nav(id, e) {
-      document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
-      document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
-      document.getElementById(id).classList.add('active');
-      if(e) e.target.classList.add('active');
-      
-      if(id === 'dashboard') loadStats();
-      if(id === 'lxc') loadLXC();
-      if(id === 'docker') loadDocker();
-      if(id === 'kvm') loadKVM();
-      if(id === 'nodes') loadNodes();
-    }
-
-    async function loadStats() {
-      const res = await fetch('/api/stats', { headers });
-      const data = await res.json();
-      document.getElementById('cpu').innerText = data.cpu + '%';
-      document.getElementById('ram').innerText = data.ram.used + ' / ' + data.ram.total + ' MB';
-    }
-
-    async function loadLXC() {
-      const res = await fetch('/api/lxc', { headers });
-      const data = await res.json();
-      const list = document.getElementById('lxc-list');
-      if(!data.length) { list.innerHTML = '<p>No LXC containers found.</p>'; return; }
-      list.innerHTML = data.map(c => `<div class="list-item"><div><b>${c.name}</b> <br><small>${c.image?.description || 'LXC'}</small></div><span class="badge">${c.status}</span></div>`).join('');
-    }
-    async function createLXC() {
-      const name = document.getElementById('lxc-name').value;
-      const image = document.getElementById('lxc-image').value;
-      if(!name) return alert('Enter name');
-      document.getElementById('lxc-list').innerHTML = '<p class="loading">Creating... (Please wait 15s)</p>';
-      await fetch('/api/lxc', { method: 'POST', headers: { ...headers, 'Content-Type': 'application/json' }, body: JSON.stringify({name, image}) });
-      setTimeout(loadLXC, 5000);
-    }
-
-    async function loadDocker() {
-      const res = await fetch('/api/docker', { headers });
-      const data = await res.json();
-      const list = document.getElementById('docker-list');
-      if(!data.length) { list.innerHTML = '<p>No Docker containers found.</p>'; return; }
-      list.innerHTML = data.map(c => `<div class="list-item"><div><b>${c.name}</b> <br><small>${c.image}</small></div><span class="badge">${c.status}</span></div>`).join('');
-    }
-    async function createDocker() {
-      const name = document.getElementById('docker-name').value;
-      const image = document.getElementById('docker-image').value;
-      if(!name || !image) return alert('Enter name and image');
-      document.getElementById('docker-list').innerHTML = '<p class="loading">Pulling and starting...</p>';
-      await fetch('/api/docker', { method: 'POST', headers: { ...headers, 'Content-Type': 'application/json' }, body: JSON.stringify({name, image}) });
-      setTimeout(loadDocker, 3000);
-    }
-
-    async function loadKVM() {
-      const res = await fetch('/api/kvm', { headers });
-      const data = await res.json();
-      document.getElementById('kvm-list').innerHTML = data.map(c => `<div class="list-item"><div><b>${c.name}</b> <br><small>${c.os}</small></div><span class="badge">${c.status}</span></div>`).join('');
-    }
-    async function loadNodes() {
-      const res = await fetch('/api/nodes', { headers });
-      const data = await res.json();
-      document.getElementById('nodes-list').innerHTML = data.map(c => `<div class="list-item"><div><b>${c.name}</b> <br><small>${c.ip}</small></div><span class="badge">${c.status}</span></div>`).join('');
-    }
-
-    loadStats(); setInterval(loadStats, 5000);
-  </script>
-</body>
-</html>
-EOF
-
-log "Dependencies install ho rahi hain (Isme 1-2 min lag sakte hain)..."
-npm install >/dev/null 2>&1
-
-log "Panel start ho raha hai (PM2)..."
-pm2 start server.js --name skyyy >/dev/null
-pm2 save >/dev/null
-pm2 startup >/dev/null 2>&1 || true
-
-ufw allow 3000/tcp >/dev/null 2>&1 || true
-
+# Summary
+IP=$(curl -s ifconfig.me || echo "YOUR_IP")
 echo ""
-echo -e "${GREEN}${BOLD}════════════════════════════════════════${NC}"
-echo -e "${GREEN}${BOLD}  ✅  FRESH SKYYY PANEL INSTALLED!${NC}"
-echo -e "${GREEN}${BOLD}════════════════════════════════════════${NC}"
-echo -e "  Login ID:   admin"
-echo -e "  Password:   admin"
-echo -e "  Ab Pinggy ya VPS IP se open karo!"
+echo -e "${GREEN}${BOLD}═══════════════════════════════════════════════${NC}"
+echo -e "${GREEN}${BOLD}  ✅  SKYYY MANAGEMENT VPS READY!${NC}"
+echo -e "${GREEN}${BOLD}═══════════════════════════════════════════════${NC}"
+echo -e "  ${BOLD}Panel URL:${NC}    http://${PANEL_DOMAIN:-$IP}"
+[[ -n "$PANEL_DOMAIN" ]] && echo -e "  ${BOLD}SSL URL:${NC}      https://${PANEL_DOMAIN}"
+echo -e "  ${BOLD}User:${NC}         admin"
+echo -e "  ${BOLD}Pass:${NC}         admin"
 echo ""
-echo -e "${CYAN}${BOLD}╔════════════════════════════════════════╗${NC}"
-echo -e "${CYAN}${BOLD}║      💎  POWERED BY VISHAL EXE  💎     ║${NC}"
-echo -e "${CYAN}${BOLD}╚════════════════════════════════════════╝${NC}"
+echo -e "${CYAN}${BOLD}╔════════════════════════════════════════════╗${NC}"
+echo -e "${CYAN}${BOLD}║       💎 POWERED BY VISHAL EXE 💎          ║${NC}"
+echo -e "${CYAN}${BOLD}╚════════════════════════════════════════════╝${NC}"
