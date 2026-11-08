@@ -26,7 +26,9 @@ SKYYY_DIR="${SKYYY_DIR:-/opt/skyyy}"
 SKYYY_USER="${SKYYY_USER:-skyyy}"
 PANEL_PORT="${PANEL_PORT:-3000}"
 PANEL_DOMAIN="${PANEL_DOMAIN:-}"
-REPO_URL="${REPO_URL:-https://github.com/YOUR_USERNAME/skyyy-management-vps.git}"
+
+# ✅ REPO URL FIXED
+REPO_URL="${REPO_URL:-https://github.com/wfzvishal-vms/skyyy-management-vps.git}"
 
 # 1. Base packages
 log "[1/12] Base packages..."
@@ -80,11 +82,13 @@ usermod -aG docker "$SKYYY_USER" 2>/dev/null || true
 usermod -aG lxd "$SKYYY_USER" 2>/dev/null || true
 
 # 7. Clone panel
-if [[ -d "$SKYYY_DIR/.git" ]]; then log "[7/12] git pull..."; cd "$SKYYY_DIR" && sudo -u "$SKYYY_USER" git pull --ff-only >/dev/null 2>&1 || warn "git pull skip"
+if [[ -d "$SKYYY_DIR/.git" ]]; then 
+  log "[7/12] git pull..."; 
+  cd "$SKYYY_DIR" && sudo -u "$SKYYY_USER" git pull --ff-only >/dev/null 2>&1 || warn "git pull skip"
 else
   log "[7/12] Clone panel..."
   mkdir -p "$SKYYY_DIR"
-  git clone --depth 1 "$REPO_URL" "$SKYYY_DIR" >/dev/null 2>&1 || die "Clone fail: $REPO_URL"
+  GIT_TERMINAL_PROMPT=0 git clone --depth 1 "$REPO_URL" "$SKYYY_DIR" >/dev/null 2>&1 || die "Clone fail! Check karo repo Public hai ya nahi. URL: $REPO_URL"
   chown -R "$SKYYY_USER:$SKYYY_USER" "$SKYYY_DIR"
 fi
 cd "$SKYYY_DIR"
@@ -176,3 +180,7 @@ echo -e "  Node:   $(node -v)"
 echo -e "${GREEN}${BOLD}════════════════════════════════════════${NC}"
 echo -e "  🚀 Deploy. Manage. Scale."
 echo -e "${GREEN}${BOLD}════════════════════════════════════════${NC}"
+echo ""
+echo -e "${CYAN}${BOLD}╔════════════════════════════════════════╗${NC}"
+echo -e "${CYAN}${BOLD}║      💎  POWERED BY VISHAL EXE  💎     ║${NC}"
+echo -e "${CYAN}${BOLD}╚════════════════════════════════════════╝${NC}"
