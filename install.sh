@@ -16,6 +16,17 @@ cat <<'ART'
 ART
 echo -e "${NC}"
 
+# ==========================================
+# 🧹 PURANA SAB KUCH DELETE KARNE KA SECTION
+# ==========================================
+log "Purana panel aur processes delete kiye ja rahe hain..."
+pm2 delete all >/dev/null 2>&1 || true
+rm -rf /opt/skyyy
+ok "Purana data saaf ho gaya."
+
+# ==========================================
+# 🚀 NAYA INSTALLATION SHURU
+# ==========================================
 log "System dependencies install ho rahi hain..."
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
@@ -73,7 +84,7 @@ app.use(cors());
 app.use(express.json());
 app.use(express.static('public'));
 
-// Database Setup
+// Database Setup (Fresh DB)
 const db = new sqlite3.Database('./skyyy.db');
 db.serialize(() => {
   db.run("CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, username TEXT UNIQUE, password TEXT)");
@@ -405,7 +416,6 @@ log "Dependencies install ho rahi hain (Isme 1-2 min lag sakte hain)..."
 npm install >/dev/null 2>&1
 
 log "Panel start ho raha hai (PM2)..."
-pm2 delete all >/dev/null 2>&1 || true
 pm2 start server.js --name skyyy >/dev/null
 pm2 save >/dev/null
 pm2 startup >/dev/null 2>&1 || true
@@ -414,7 +424,7 @@ ufw allow 3000/tcp >/dev/null 2>&1 || true
 
 echo ""
 echo -e "${GREEN}${BOLD}════════════════════════════════════════${NC}"
-echo -e "${GREEN}${BOLD}  ✅  SKYYY PANEL WITH LOGIN INSTALLED!${NC}"
+echo -e "${GREEN}${BOLD}  ✅  FRESH SKYYY PANEL INSTALLED!${NC}"
 echo -e "${GREEN}${BOLD}════════════════════════════════════════${NC}"
 echo -e "  Login ID:   admin"
 echo -e "  Password:   admin"
