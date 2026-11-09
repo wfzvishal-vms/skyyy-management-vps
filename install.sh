@@ -11,11 +11,12 @@ echo "[1/7] Checking environment..."
 [[ "$ID" == "ubuntu" && "$VERSION_ID" == "24.04" ]] || echo "Warning: tested on Ubuntu 24.04"
 uname -m | grep -q x86_64 || { echo "x86_64 required"; exit 1; }
 
-echo "[2/7] Installing system dependencies..."
+echo "[2/7] Installing system dependencies (this takes a few minutes)..."
 apt-get update
-apt-get install -y python3 python3-venv python3-pip nginx curl git qemu-kvm libvirt-daemon-system libvirt-clients bridge-utils cloud-image-utils genisoimage
+# FIXED: Added pkg-config, libvirt-dev, gcc, and build-essential for libvirt-python
+apt-get install -y python3 python3-venv python3-pip nginx curl git qemu-kvm libvirt-daemon-system libvirt-clients bridge-utils cloud-image-utils genisoimage pkg-config libvirt-dev gcc build-essential
 
-echo "[3/7] Installing Incus & Docker..."
+echo "[3/7] Installing Incus (LXC) & Docker..."
 command -v incus >/dev/null || apt-get install -y incus
 if ! incus profile list >/dev/null 2>&1; then
   cat <<EOF | incus admin init --preseed
@@ -398,7 +399,9 @@ EOF
 
 echo "[5/7] Setting up user and permissions..."
 id -u skyyy &>/dev/null || useradd --system --home "$INSTALL_DIR" --shell /usr/sbin/nologin skyyy
-usermod -aG incus,docker,libvirt skyyy || true
+# FIXED: Added incus-admin group for Ubuntu 24.04
+usermod -aG incus-admin,docker,libvirt skyyy || true
+
 python3 -m venv "$INSTALL_DIR/venv"
 "$INSTALL_DIR/venv/bin/pip" install -r "$INSTALL_DIR/requirements.txt"
 chown -R skyyy:skyyy "$INSTALL_DIR" "$DATA_DIR"
